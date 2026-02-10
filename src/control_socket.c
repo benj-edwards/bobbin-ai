@@ -1064,20 +1064,28 @@ static void handle_command(const char *cmd, size_t len) {
     // =========================================================================
     else if (strcmp(cmd_type, "dhgr") == 0) {
         int page = 1;
+        int color = 0;
         char path[512] = {0};
 
         json_get_int(cmd, "page", &page);
+        json_get_int(cmd, "color", &color);
         if (!json_get_string(cmd, "path", path, sizeof(path))) {
             send_error("missing path");
             return;
         }
 
         word base = (page == 2) ? 0x4000 : 0x2000;
-        int result = dhgr_export_ppm(base, path);
+        int result;
+        if (color) {
+            result = dhgr_export_ppm_color(base, path);
+        } else {
+            result = dhgr_export_ppm(base, path);
+        }
 
         if (result == 0) {
+            const char *mode = color ? "color" : "mono";
             snprintf(resp_buffer, sizeof(resp_buffer),
-                     "{\"ok\":true,\"path\":\"%s\",\"width\":560,\"height\":192}", path);
+                     "{\"ok\":true,\"path\":\"%s\",\"width\":560,\"height\":192,\"mode\":\"%s\"}", path, mode);
             send_response(resp_buffer);
         } else {
             send_error("failed to write file");

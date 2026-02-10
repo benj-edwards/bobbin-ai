@@ -446,7 +446,7 @@ int dhgr_export_ascii(word base, const char *filename, int scale)
     return 0;
 }
 
-// Export DHGR to PPM (mono)
+// Export DHGR to PPM (mono - 560x192)
 int dhgr_export_ppm(word base, const char *filename)
 {
     if (!have_aux_memory()) {
@@ -467,6 +467,76 @@ int dhgr_export_ppm(word base, const char *filename)
             fputc(val, f);
             fputc(val, f);
             fputc(val, f);
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+// Get a color pixel from DHGR memory (0-15, 140x192 resolution)
+// DHGR color groups 4 adjacent bits into a 4-bit color value.
+// The bit stream across aux/main bytes (ignoring bit 7 of each):
+//   aux0[0..6], main0[0..6], aux1[0..6], main1[0..6], ...
+// = 28 data bits per 4-byte group = 7 color pixels per group.
+static int dhgr_get_color_pixel(word base, int x, int y)
+{
+    if (x < 0 || x >= 140 || y < 0 || y >= DHGR_HEIGHT) {
+        return 0;
+    }
+
+    const byte *mem = getram();
+    word line_addr = hgr_line_addr(y, base);
+
+    // Each color pixel is 4 bits wide.
+    // 7 color pixels span 4 bytes (aux0, main0, aux1, main1) = 28 data bits.
+    int group = x / 7;           // Which 4-byte group (0-19)
+    int pixel_in_group = x % 7;  // Which pixel within group (0-6)
+    int bit_start = pixel_in_group * 4;  // Starting bit offset (0,4,8,12,16,20,24)
+
+    // Read the 4 bytes in this group: aux0, main0, aux1, main1
+    int byte_col = group * 2;  // Starting main/aux column pair
+    byte aux0  = mem[AUX_OFFSET + line_addr + byte_col];
+    byte main0 = mem[line_addr + byte_col];
+    byte aux1  = mem[AUX_OFFSET + line_addr + byte_col + 1];
+    byte main1 = mem[line_addr + byte_col + 1];
+
+    // Build 28-bit stream from the 7 data bits of each byte (strip bit 7)
+    // Bit order: aux0[0..6], main0[0..6], aux1[0..6], main1[0..6]
+    unsigned int bits = (aux0 & 0x7F)
+                      | ((unsigned int)(main0 & 0x7F) << 7)
+                      | ((unsigned int)(aux1 & 0x7F) << 14)
+                      | ((unsigned int)(main1 & 0x7F) << 21);
+
+    // Extract 4-bit color value
+    int color = (bits >> bit_start) & 0x0F;
+    return color;
+}
+
+// Export DHGR to PPM (color - 140x192, 16 colors, scaled to 560x192)
+int dhgr_export_ppm_color(word base, const char *filename)
+{
+    if (!have_aux_memory()) {
+        return -3;  // No aux memory
+    }
+
+    FILE *f = fopen(filename, "wb");
+    if (!f) {
+        return -1;
+    }
+
+    // Output at 560x192 (each color pixel = 4 wide) for consistent sizing
+    fprintf(f, "P6\n%d %d\n255\n", DHGR_WIDTH, DHGR_HEIGHT);
+
+    for (int y = 0; y < DHGR_HEIGHT; y++) {
+        for (int cx = 0; cx < 140; cx++) {
+            int color = dhgr_get_color_pixel(base, cx, y);
+            // Each color pixel is 4 screen pixels wide
+            for (int i = 0; i < 4; i++) {
+                fputc(GR_COLORS[color][0], f);
+                fputc(GR_COLORS[color][1], f);
+                fputc(GR_COLORS[color][2], f);
+            }
         }
     }
 
@@ -852,7 +922,7 @@ bool dhgr_command_do(const char *line, printer pr)
 {
     word base = 0;
     const char *filename = NULL;
-    int cmd_type = 0;  // 1=ascii, 2=ppm
+    int cmd_type = 0;  // 1=ascii, 2=ppm mono, 3=ppm color
 
     // DHGR1 ASCII
     if (!cmd_type && (filename = check_prefix(line, "save-dhgr-ascii ")) != NULL) {
@@ -862,12 +932,20 @@ bool dhgr_command_do(const char *line, printer pr)
         base = HGR1_BASE; cmd_type = 1;
     }
 
-    // DHGR1 PPM
+    // DHGR1 PPM (mono)
     if (!cmd_type && (filename = check_prefix(line, "save-dhgr-ppm ")) != NULL) {
         base = HGR1_BASE; cmd_type = 2;
     }
     if (!cmd_type && (filename = check_prefix(line, "sdhp ")) != NULL) {
         base = HGR1_BASE; cmd_type = 2;
+    }
+
+    // DHGR1 PPM (color)
+    if (!cmd_type && (filename = check_prefix(line, "save-dhgr-ppm-color ")) != NULL) {
+        base = HGR1_BASE; cmd_type = 3;
+    }
+    if (!cmd_type && (filename = check_prefix(line, "sdhpc ")) != NULL) {
+        base = HGR1_BASE; cmd_type = 3;
     }
 
     // DHGR2 ASCII
@@ -878,12 +956,20 @@ bool dhgr_command_do(const char *line, printer pr)
         base = HGR2_BASE; cmd_type = 1;
     }
 
-    // DHGR2 PPM
+    // DHGR2 PPM (mono)
     if (!cmd_type && (filename = check_prefix(line, "save-dhgr2-ppm ")) != NULL) {
         base = HGR2_BASE; cmd_type = 2;
     }
     if (!cmd_type && (filename = check_prefix(line, "sdhp2 ")) != NULL) {
         base = HGR2_BASE; cmd_type = 2;
+    }
+
+    // DHGR2 PPM (color)
+    if (!cmd_type && (filename = check_prefix(line, "save-dhgr2-ppm-color ")) != NULL) {
+        base = HGR2_BASE; cmd_type = 3;
+    }
+    if (!cmd_type && (filename = check_prefix(line, "sdhpc2 ")) != NULL) {
+        base = HGR2_BASE; cmd_type = 3;
     }
 
     if (!cmd_type) {
@@ -915,10 +1001,19 @@ bool dhgr_command_do(const char *line, printer pr)
             }
             break;
 
-        case 2:  // PPM
+        case 2:  // PPM mono
             result = dhgr_export_ppm(base, filename);
             if (result == 0) {
                 pr("Saved %s to PPM file \"%s\" (560x192, mono).\n", page, filename);
+            } else {
+                pr("ERR: Could not save to \"%s\": %s\n", filename, strerror(errno));
+            }
+            break;
+
+        case 3:  // PPM color
+            result = dhgr_export_ppm_color(base, filename);
+            if (result == 0) {
+                pr("Saved %s to PPM file \"%s\" (560x192, 16 colors).\n", page, filename);
             } else {
                 pr("ERR: Could not save to \"%s\": %s\n", filename, strerror(errno));
             }
