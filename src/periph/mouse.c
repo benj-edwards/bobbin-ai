@@ -10,6 +10,7 @@
 #include "bobbin-internal.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ROM size and structure
@@ -96,10 +97,22 @@ void mouse_get_state(word *x, word *y, bool *button)
 
 static void load_mouse_rom(void)
 {
-    // Try multiple paths for the ROM file
+    // Try multiple paths for the ROM file. $BOBBIN_ROMDIR and the roms/
+    // next to the bobbin binary work when the MCP server runs it from a
+    // different directory, as the main ROMs do (mem.c)
+    char env_path[512] = "", exe_path[512] = "";
+    const char *env = getenv("BOBBIN_ROMDIR");
+    if (env != NULL)
+        snprintf(env_path, sizeof env_path, "%s/cards/mouse.rom", env);
+    const char *slash = strrchr(program_name, '/');
+    if (slash != NULL)
+        snprintf(exe_path, sizeof exe_path, "%.*s/roms/cards/mouse.rom",
+                 (int)(slash - program_name), program_name);
     const char *rom_paths[] = {
         "roms/cards/mouse.rom",
         "../roms/cards/mouse.rom",
+        env_path,
+        exe_path,
         ROMSRCHDIR "/cards/mouse.rom",
         NULL
     };
