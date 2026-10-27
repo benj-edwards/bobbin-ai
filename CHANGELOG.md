@@ -15,6 +15,8 @@
 
 - **Uthernet II virtual UDP**: datagrams to 192.168.64.x/65.x or the broadcast address go to the same port on localhost; replies come back from that address (broadcasts are answered from the gateway, 192.168.65.1). Enough for LAN service discovery.
 - `BOBBIN_U2_RESET_ON_RESET=1`: an Apple II reset also resets the W5100, as a card wired to the bus /RESET would.
+- `BOBBIN_U2_CORRUPT_LEN_EVERY=n`: every nth frame's length prefix in the RX ring reads 9 too long, as one misread header would; a driver that trusts it misreads every frame after.
+- **Injected frames are padded to 60 bytes** like real Ethernet (ARP replies, pure ACKs and short UDP were shorter), and the ARP reply is no longer built at the start of the RX ring itself, over whatever was waiting there.
 - `BOBBIN_U2_CORRUPT_EVERY=n`: garble one byte of every nth virtual TCP data segment after its checksum is made (alternately a payload byte and the header length), the way a flaky bus read on a real Apple II can. A guest TCP stack that checks checksums drops it and gets it again.
 - `BOBBIN_U2_UDP_PORT=n`: the virtual network's UDP (broadcasts included) goes to localhost:n instead of the port it was addressed to, so a test's emulated Apple II has a discovery channel of its own and never reaches a real service on the usual port.
 

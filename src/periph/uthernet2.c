@@ -172,6 +172,16 @@ static word get_rx_base(int socknum);
 static void handle_macraw_send(int socknum);
 static void inject_dhcp_response(int socknum, bool is_ack);
 
+// Real Ethernet pads short frames to 60 bytes (before the FCS), so a W5100
+// on a real network never hands over less; the driver may rely on it.
+#define ETH_MIN_FRAME 60
+static int pad_frame(byte *pkt, int pos)    // pos counts the 2-byte prefix
+{
+    while (pos < 2 + ETH_MIN_FRAME)
+        pkt[pos++] = 0;
+    return pos;
+}
+
 //=============================================================================
 // Virtual DHCP Implementation
 //=============================================================================
@@ -493,6 +503,7 @@ static void inject_dhcp_response(int socknum, bool is_ack)
 
     // W5100 length prefix: total size INCLUDING the 2-byte header
     // IP65 reads this value and subtracts 2 to get the frame length
+    pos = pad_frame(pkt, pos);
     pkt[0] = (pos >> 8) & 0xFF;
     pkt[1] = pos & 0xFF;
 
@@ -538,8 +549,9 @@ static void handle_arp_packet(int socknum, byte *frame, int len)
 static void inject_arp_reply(int socknum, byte *request_frame)
 {
     SocketState *ss = &u2.sockets[socknum];
-    // Write to ss->rx_buf (same as DHCP does)
-    byte *pkt = ss->rx_buf;
+    // Built on its own, then copied to the ring's tail (it used to be built
+    // at the start of the ring itself, over whatever was waiting there)
+    byte pkt[2 + ETH_MIN_FRAME];
 
     byte *req_arp = request_frame + ETH_HEADER_LEN;
     int pos = 2;  // Skip W5100 length prefix
@@ -578,6 +590,7 @@ static void inject_arp_reply(int socknum, byte *request_frame)
     pos += 4;
 
     // W5100 length prefix
+    pos = pad_frame(pkt, pos);
     pkt[0] = (pos >> 8) & 0xFF;
     pkt[1] = pos & 0xFF;
 
@@ -917,9 +930,26 @@ static void inject_tcp_response(int socknum, byte flags, byte *data, int data_le
     }
 
     // W5100 length prefix
+    pos = pad_frame(tmp, pos);
     int pkt_len = pos;
     tmp[0] = (pkt_len >> 8) & 0xFF;
     tmp[1] = pkt_len & 0xFF;
+
+    // BOBBIN_U2_CORRUPT_LEN_EVERY=n: every nth frame's length prefix reads 9
+    // too long, as one misread of the header would. The driver then reads
+    // past the frame and every header after it is off the boundary - unless
+    // it notices the lengths no longer make sense.
+    static int bad_len_every = -1, bad_len_count = 0;
+    if (bad_len_every < 0) {
+        const char *e = getenv("BOBBIN_U2_CORRUPT_LEN_EVERY");
+        bad_len_every = e ? atoi(e) : 0;
+    }
+    if (bad_len_every > 0 && ++bad_len_count >= bad_len_every) {
+        bad_len_count = 0;
+        tmp[0] = ((pkt_len + 9) >> 8) & 0xFF;
+        tmp[1] = (pkt_len + 9) & 0xFF;
+        DEBUG("Uthernet II: frame length reported as %d (really %d)\n", pkt_len + 9, pkt_len);
+    }
 
     // Check available space in circular buffer
     word used = (ss->rx_tail - ss->rx_head) & (SOCK_BUF_SIZE - 1);
@@ -1129,6 +1159,7 @@ static void virtual_udp_poll(int socknum)
     memcpy(&pkt[pos], data, n);
     pos += n;
 
+    pos = pad_frame(pkt, pos);
     pkt[0] = pos >> 8;
     pkt[1] = pos & 0xFF;
     for (int i = 0; i < pos; i++) {
