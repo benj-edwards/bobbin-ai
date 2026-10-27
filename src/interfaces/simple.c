@@ -815,6 +815,11 @@ static void iface_simple_peek(Event *e)
     } else if ((!machine_is_iie() && a == SS_KBDSTROBE)
                || e->loc == SS_KBDSTROBE) {
         consume_char();
+    } else if (e->loc == 0xC061 || e->loc == 0xC062 || e->loc == 0xC063) {
+        // Open-Apple / Closed-Apple / shift: not pressed. (Floating bits
+        // read as "pressed" made the //e run its self-test on Ctrl-Reset,
+        // and programs see phantom button presses.)
+        e->val &= 0x7F;
     }
 }
 

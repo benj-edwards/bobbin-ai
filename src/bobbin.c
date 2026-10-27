@@ -27,6 +27,27 @@ word current_pc(void) {
 
 static void handle_io_opts(void);
 
+// Execute one instruction, giving hooks (and the debugger) their chance to
+// alter the PC first. With honor_breakpoints, a control socket breakpoint
+// or watchpoint stops us *before* the instruction (and before its hooks);
+// then nothing runs and we return false.
+bool bobbin_step(bool honor_breakpoints)
+{
+    do {
+        current_pc_val = PC;
+        if (honor_breakpoints && control_socket_check_breakpoints())
+            return false;
+        event_fire(EV_PRESTEP);
+        debugger();
+    } while (current_pc_val != PC); // dbgr is allowed to change pc, too
+                                    // and since it was  user-requested,
+                                    // doesn't get count-limited.
+
+    event_fire(EV_STEP);
+    cpu_step();
+    return true;
+}
+
 void bobbin_run(void)
 {
     setlocale(LC_ALL, "");
@@ -71,18 +92,10 @@ void bobbin_run(void)
         if (check_watches()) frame_count = 0;
         cycle_count = 0;
         do {
-            // Provide hooks the opportunity to alter the PC, here
-            do {
-                current_pc_val = PC;
-                event_fire(EV_PRESTEP);
-                debugger();
-            } while (current_pc_val != PC); // dbgr is allowed to change pc, too
-                                            // and since it was  user-requested,
-                                            // doesn't get count-limited.
-
-            event_fire(EV_STEP);
-            cpu_step();
+            if (!bobbin_step(true)) break;
         } while (cycle_count < CYCLES_PER_FRAME);
+        // A breakpoint paused us mid-frame: wait for resume
+        if (control_socket_paused()) continue;
         frame_count += cycle_count / CYCLES_PER_FRAME;
         if (cfg.max_frames != 0 && frame_count >= cfg.max_frames) {
             fputc('\n', stderr);

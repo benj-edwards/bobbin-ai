@@ -52,6 +52,8 @@ typedef struct {
 
 static CtlBreakpoint breakpoints[MAX_BREAKPOINTS];
 static int num_breakpoints = 0;
+static int break_hit = -1;      // id that paused us, until resume
+static int skip_pc = -1;        // resume runs this PC once before it can break again
 
 // Speed control
 static bool turbo_override = false;
@@ -166,11 +168,15 @@ void control_socket_cleanup(void) {
     }
 }
 
-// Check breakpoints - called from main loop
+// Check breakpoints - called before every instruction (bobbin_step).
+// True means: paused, don't execute the instruction at current_pc().
 bool control_socket_check_breakpoints(void) {
     if (paused) return true;
+    if (num_breakpoints == 0 && !single_step_mode) return false;
 
     word pc = current_pc();
+    int skip = skip_pc;     // only the first instruction after a resume
+    skip_pc = -1;
 
     for (int i = 0; i < num_breakpoints; i++) {
         if (!breakpoints[i].enabled) continue;
@@ -180,12 +186,14 @@ bool control_socket_check_breakpoints(void) {
             byte cur_val = peek_sneaky(breakpoints[i].addr);
             if (cur_val != breakpoints[i].last_val) {
                 breakpoints[i].last_val = cur_val;
+                break_hit = i;
                 paused = true;
                 return true;
             }
         } else {
             // Breakpoint - check PC
-            if (pc == breakpoints[i].addr) {
+            if (pc == breakpoints[i].addr && pc != skip) {
+                break_hit = i;
                 paused = true;
                 return true;
             }
@@ -347,8 +355,26 @@ static bool json_get_string(const char *json, const char *key, char *out, size_t
                 case 'n': out[i++] = '\n'; break;
                 case 'r': out[i++] = '\r'; break;
                 case 't': out[i++] = '\t'; break;
+                case 'b': out[i++] = '\b'; break;
+                case 'f': out[i++] = '\f'; break;
                 case '\\': out[i++] = '\\'; break;
                 case '"': out[i++] = '"'; break;
+                case 'u': {
+                    // \uXXXX - JSON encoders use this for control keys
+                    // (ESC = \u001b, arrows = \u0008 \u0015 \u000b \u000a)
+                    unsigned v = 0;
+                    int k;
+                    for (k = 0; k < 4 && p[1]; k++) {
+                        char h = p[1];
+                        if (h >= '0' && h <= '9') v = v * 16 + (h - '0');
+                        else if (h >= 'a' && h <= 'f') v = v * 16 + (h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') v = v * 16 + (h - 'A' + 10);
+                        else break;
+                        p++;
+                    }
+                    out[i++] = (char)(v & 0xFF);
+                    break;
+                }
                 default: out[i++] = *p; break;
             }
         } else {
@@ -552,12 +578,22 @@ static void handle_command(const char *cmd, size_t len) {
         char *p = resp_buffer;
         p += sprintf(p, "{\"ok\":true,\"lines\":[");
 
+        // What the video hardware shows, whatever RAMRD says: main memory,
+        // page 2 if selected (and 80STORE isn't borrowing PAGE2), and in
+        // 80 columns aux and main interleaved (even columns from aux)
+        const byte *ram = getram();
+        bool eighty = swget(ss, ss_eightycol);
+        word page_offset = (swget(ss, ss_page2) && !swget(ss, ss_eightystore)) ? 0x400 : 0;
+        int cols = eighty ? 80 : 40;
+
         for (int row = 0; row < 24; row++) {
             if (row > 0) *p++ = ',';
             *p++ = '"';
 
-            for (int col = 0; col < 40; col++) {
-                byte c = peek_sneaky(text_line_addrs[row] + col);
+            for (int col = 0; col < cols; col++) {
+                word addr = text_line_addrs[row] + page_offset;
+                byte c = eighty ? ram[(col & 1 ? 0 : 0x10000) + addr + col / 2]
+                                : ram[addr + col];
                 int ascii = screen_char_to_ascii(c);
 
                 if (ascii == '"') {
@@ -619,9 +655,11 @@ static void handle_command(const char *cmd, size_t len) {
     else if (strcmp(cmd_type, "cpu") == 0) {
         snprintf(resp_buffer, sizeof(resp_buffer),
                  "{\"ok\":true,\"pc\":%d,\"a\":%d,\"x\":%d,\"y\":%d,\"sp\":%d,\"p\":%d,"
-                 "\"cycles\":%" PRIuMAX ",\"instructions\":%" PRIuMAX ",\"frames\":%" PRIuMAX "}",
+                 "\"cycles\":%" PRIuMAX ",\"instructions\":%" PRIuMAX ",\"frames\":%" PRIuMAX ","
+                 "\"paused\":%s,\"break_hit\":%d}",
                  PC, ACC, XREG, YREG, SP, PFLAGS,
-                 cycle_count, instr_count, frame_count);
+                 cycle_count, instr_count, frame_count,
+                 paused ? "true" : "false", break_hit);
         send_response(resp_buffer);
     }
 
@@ -638,6 +676,8 @@ static void handle_command(const char *cmd, size_t len) {
         cpu_reset();
         event_fire(EV_RESET);
         paused = false;
+        break_hit = -1;
+        skip_pc = -1;
 
         send_ok();
     }
@@ -654,8 +694,12 @@ static void handle_command(const char *cmd, size_t len) {
     // RESUME - Resume emulation
     // =========================================================================
     else if (strcmp(cmd_type, "resume") == 0) {
+        // Stopped on a breakpoint: run that instruction rather than stopping
+        // on it again straight away
+        if (paused) skip_pc = PC;
         paused = false;
         single_step_mode = false;
+        break_hit = -1;
         send_ok();
     }
 
@@ -668,9 +712,10 @@ static void handle_command(const char *cmd, size_t len) {
         if (count < 1) count = 1;
         if (count > 1000) count = 1000;
 
-        // Execute instructions
+        // Execute instructions the way the main loop does (hooks included,
+        // e.g. --simple's COUT/RDKEY traps), ignoring breakpoints
         for (int i = 0; i < count; i++) {
-            cpu_step();
+            bobbin_step(false);
         }
 
         // Return new CPU state

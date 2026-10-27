@@ -530,7 +530,11 @@ static int switch_reads(word loc)
             b = swget(ss, ss_eightystore);
             break;
         case 9:
-            b = swget(ss, ss_vertblank);
+            // RDVBLBAR (//e): bit 7 is low during vertical blanking, the
+            // last 70 of each frame's 262 scan lines. (It used to read a
+            // switch nothing ever set: always "blanking", so games that
+            // sync to it hung.)
+            b = (cycle_count % CYCLES_PER_FRAME) < 192 * CYCLES_PER_LINE;
             break;
         case 0xA:
             b = swget(ss, ss_text);

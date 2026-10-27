@@ -37,6 +37,7 @@ typedef uint8_t     byte;
 #define LO(w)           (0x00FF & (w))
 
 extern void bobbin_run(void);
+extern bool bobbin_step(bool honor_breakpoints); // one instruction, hooks included
 extern word current_pc(void);
 
 /********** LOGGING **********/

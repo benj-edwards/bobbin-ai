@@ -101,6 +101,9 @@
 
 // Per-socket buffer sizes (default 2KB each)
 #define SOCK_BUF_SIZE   0x0800  // 2KB per socket
+#define VTCP_CHUNK      536     // Max TCP payload per virtual segment (a real host's default MSS)
+#define VTCP_BUF        16384   // Host data not yet acknowledged by the Apple II
+#define VTCP_RTO_FRAMES 30      // Resend unacknowledged data after 0.5 s (emulated) without progress
 
 // Apple II I/O soft switch offsets
 // For slot N: $C0n4 = Mode, $C0n5 = Addr Hi, $C0n6 = Addr Lo, $C0n7 = Data
@@ -164,6 +167,7 @@ static void socket_poll(int socknum);
 static void virtual_tcp_poll(int socknum);
 static word get_socket_base(int socknum);
 static word get_tx_base(int socknum);
+static word get_tx_size(int socknum);
 static word get_rx_base(int socknum);
 static void handle_macraw_send(int socknum);
 static void inject_dhcp_response(int socknum, bool is_ack);
@@ -265,11 +269,21 @@ static struct {
     byte local_ip[4];           // IP address client connected to (for response)
     word remote_port;           // Client port
     word local_port;            // Server port (target port on gateway)
-    uint32_t our_seq;           // Our sequence number
+    uint32_t our_seq;           // Our sequence number (next byte to send)
     uint32_t their_seq;         // Their sequence number (next expected)
     bool established;           // Connection is established
     bool fin_sent;              // We sent FIN
     bool fin_received;          // We received FIN
+    // Like a real host: keep what we sent until the Apple II acknowledges
+    // it, and send it again if it doesn't. (A virtual TCP that ignored the
+    // Apple's ACKs hid an agent bug that only acknowledged part of large
+    // segments.)
+    uint32_t snd_una;           // Oldest byte not yet acknowledged
+    word snd_wnd;               // Window the Apple II advertised
+    uintmax_t last_progress;    // frame_count when an ACK last moved snd_una
+    bool host_closed;           // Host side hit EOF: FIN once all is acked
+    int txlen;                  // Bytes in txbuf (from snd_una on)
+    byte txbuf[VTCP_BUF];
 } virtual_tcp = { .fd = -1 };
 
 // Forward declarations for TCP
@@ -703,12 +717,17 @@ static void handle_tcp_packet(int socknum, byte *frame, int len)
         virtual_tcp.established = false;
         virtual_tcp.fin_sent = false;
         virtual_tcp.fin_received = false;
+        virtual_tcp.host_closed = false;
+        virtual_tcp.txlen = 0;
+        virtual_tcp.snd_wnd = (tcp[TCP_WINDOW] << 8) | tcp[TCP_WINDOW + 1];
 
         // Send SYN-ACK
         DEBUG("Uthernet II: TCP sending SYN-ACK to port %d\n", dst_port);
         inject_tcp_response(socknum, TCP_SYN | TCP_ACK_FLAG, NULL, 0);
         DEBUG("Uthernet II: SYN-ACK injected\n");
         virtual_tcp.our_seq++;  // SYN counts as 1 byte
+        virtual_tcp.snd_una = virtual_tcp.our_seq;
+        virtual_tcp.last_progress = frame_count;
         return;
     }
 
@@ -719,47 +738,47 @@ static void handle_tcp_packet(int socknum, byte *frame, int len)
             virtual_tcp.established = true;
         }
 
+        // What the Apple II has received: drop it from the resend buffer
+        uint32_t ack = ((uint32_t)tcp[TCP_ACK] << 24) | ((uint32_t)tcp[TCP_ACK + 1] << 16) |
+                       ((uint32_t)tcp[TCP_ACK + 2] << 8) | (uint32_t)tcp[TCP_ACK + 3];
+        int32_t acked = (int32_t)(ack - virtual_tcp.snd_una);
+        if (acked > 0 && acked <= virtual_tcp.txlen) {
+            memmove(virtual_tcp.txbuf, virtual_tcp.txbuf + acked, virtual_tcp.txlen - acked);
+            virtual_tcp.txlen -= acked;
+            virtual_tcp.snd_una = ack;
+            virtual_tcp.last_progress = frame_count;
+            if ((int32_t)(virtual_tcp.our_seq - ack) < 0) {
+                virtual_tcp.our_seq = ack;
+            }
+        }
+        virtual_tcp.snd_wnd = (tcp[TCP_WINDOW] << 8) | tcp[TCP_WINDOW + 1];
+
         // Handle incoming data
         if (tcp_data_len > 0) {
             byte *data = tcp + tcp_header_len;
             DEBUG("TCP data from Apple II: %d bytes\n", tcp_data_len);
 
-            // Forward data to host socket
-            if (virtual_tcp.fd >= 0) {
-                ssize_t sent = send(virtual_tcp.fd, data, tcp_data_len, 0);
-                if (sent > 0) {
-                    DEBUG("TCP forwarded %zd bytes to host\n", sent);
+            // Forward it only if it's the next data we expect - a resent
+            // segment (the Apple II's ACK wait timed out) is a duplicate
+            if (their_seq == virtual_tcp.their_seq) {
+                if (virtual_tcp.fd >= 0) {
+                    ssize_t sent = send(virtual_tcp.fd, data, tcp_data_len, 0);
+                    if (sent > 0) {
+                        DEBUG("TCP forwarded %zd bytes to host\n", sent);
+                    }
                 }
+                virtual_tcp.their_seq = their_seq + tcp_data_len;
+            } else {
+                DEBUG("TCP dropped %d bytes at seq %u (expected %u)\n",
+                      tcp_data_len, their_seq, virtual_tcp.their_seq);
             }
-
-            // Update their sequence number
-            virtual_tcp.their_seq = their_seq + tcp_data_len;
 
             // Send ACK
             inject_tcp_response(socknum, TCP_ACK_FLAG, NULL, 0);
 
-            // Check for response data from host
-            if (virtual_tcp.fd >= 0) {
-                struct pollfd pfd = { virtual_tcp.fd, POLLIN, 0 };
-                while (poll(&pfd, 1, 50) > 0) {  // Small timeout to gather data
-                    byte recv_buf[1400];
-                    ssize_t got = recv(virtual_tcp.fd, recv_buf, sizeof(recv_buf), 0);
-                    if (got > 0) {
-                        DEBUG("TCP got %zd bytes from host\n", got);
-                        inject_tcp_response(socknum, TCP_ACK_FLAG | TCP_PSH, recv_buf, got);
-                        virtual_tcp.our_seq += got;
-                    } else if (got == 0) {
-                        // Connection closed by host
-                        DEBUG("Uthernet II: TCP host closed connection\n");
-                        inject_tcp_response(socknum, TCP_FIN | TCP_ACK_FLAG, NULL, 0);
-                        virtual_tcp.fin_sent = true;
-                        virtual_tcp.our_seq++;
-                        break;
-                    } else {
-                        break;
-                    }
-                }
-            }
+            // Pick up any response data from host right away (non-blocking,
+            // limited to what fits in the RX buffer - see virtual_tcp_poll)
+            virtual_tcp_poll(socknum);
         }
     }
 
@@ -792,9 +811,11 @@ static void handle_tcp_packet(int socknum, byte *frame, int len)
 static void inject_tcp_response(int socknum, byte flags, byte *data, int data_len)
 {
     SocketState *ss = &u2.sockets[socknum];
+    if (!data || data_len < 0) data_len = 0;
+    if (data_len > VTCP_CHUNK) data_len = VTCP_CHUNK;
 
     // Build packet in temp buffer first, then copy to circular rx_buf
-    byte tmp[256];  // Max TCP packet we'll send
+    byte tmp[2 + ETH_HEADER_LEN + IPH_HEADER_LEN + TCP_HEADER_LEN + VTCP_CHUNK];
     int pos = 2;    // Skip W5100 length prefix
 
     // Ethernet header
@@ -866,7 +887,7 @@ static void inject_tcp_response(int socknum, byte flags, byte *data, int data_le
     tmp[pos++] = 0x00; tmp[pos++] = 0x00;
 
     // Data
-    if (data && data_len > 0 && data_len < 180) {
+    if (data_len > 0) {
         memcpy(&tmp[pos], data, data_len);
         pos += data_len;
     }
@@ -875,6 +896,25 @@ static void inject_tcp_response(int socknum, byte flags, byte *data, int data_le
     word tcp_cksum = tcp_checksum(&tmp[ip_start], &tmp[tcp_start], tcp_len);
     tmp[tcp_start + TCP_CHECKSUM] = tcp_cksum >> 8;
     tmp[tcp_start + TCP_CHECKSUM + 1] = tcp_cksum & 0xFF;
+
+    // BOBBIN_U2_CORRUPT_EVERY=n: garble one byte of every nth data segment
+    // after its checksum is made, as a flaky bus read on a real Apple II can.
+    // A stack that checks TCP checksums drops the segment and gets it again;
+    // one that doesn't takes the garbage. Alternates between a payload byte
+    // and the header length (which, believed, moves the ACK past the data).
+    static int corrupt_every = -1, corrupt_count = 0, corrupt_n = 0;
+    if (corrupt_every < 0) {
+        const char *e = getenv("BOBBIN_U2_CORRUPT_EVERY");
+        corrupt_every = e ? atoi(e) : 0;
+    }
+    if (corrupt_every > 0 && data_len > 0 && ++corrupt_count >= corrupt_every) {
+        corrupt_count = 0;
+        if (corrupt_n++ % 2 == 0)
+            tmp[tcp_start + TCP_HEADER_LEN + (corrupt_n * 7) % data_len] ^= 0x5A;
+        else
+            tmp[tcp_start + 12] = 0x40;     // header length 16: looks 4 bytes short
+        DEBUG("Uthernet II: corrupted segment %d (seq %u)\n", corrupt_n, (unsigned)virtual_tcp.our_seq);
+    }
 
     // W5100 length prefix
     int pkt_len = pos;
@@ -920,43 +960,182 @@ static void virtual_tcp_poll(int socknum)
 
     SocketState *ss = &u2.sockets[socknum];
 
-    // Check for data from host
-    struct pollfd pfd = { virtual_tcp.fd, POLLIN, 0 };
-    int poll_result = poll(&pfd, 1, 0);
-    if (poll_result > 0) {
-        byte recv_buf[1400];
-        ssize_t got = recv(virtual_tcp.fd, recv_buf, sizeof(recv_buf), 0);
-        DEBUG("virtual_tcp_poll: got %zd bytes from host\n", got);
+    // No progress for a while: the Apple II missed something (or acked
+    // only part of it). Go back and send again from what it acknowledged.
+    if (virtual_tcp.our_seq != virtual_tcp.snd_una &&
+        frame_count - virtual_tcp.last_progress > VTCP_RTO_FRAMES) {
+        DEBUG("Uthernet II: TCP resend from %u (had sent up to %u)\n",
+              virtual_tcp.snd_una, virtual_tcp.our_seq);
+        virtual_tcp.our_seq = virtual_tcp.snd_una;
+        virtual_tcp.last_progress = frame_count;
+    }
 
+    // Take host data while the resend buffer has room (the host's own TCP
+    // applies backpressure beyond that)
+    if (!virtual_tcp.host_closed && virtual_tcp.txlen < VTCP_BUF) {
+        ssize_t got = recv(virtual_tcp.fd, virtual_tcp.txbuf + virtual_tcp.txlen,
+                           VTCP_BUF - virtual_tcp.txlen, 0);
         if (got > 0) {
             DEBUG("Uthernet II: TCP received %zd bytes from host (poll)\n", got);
-            // Split large chunks to avoid exceeding inject_tcp_response's 180 byte limit
-            ssize_t remaining = got;
-            byte *ptr = recv_buf;
-            while (remaining > 0) {
-                ssize_t chunk = remaining > 160 ? 160 : remaining;
-                inject_tcp_response(socknum, TCP_ACK_FLAG | TCP_PSH, ptr, chunk);
-                virtual_tcp.our_seq += chunk;
-                ptr += chunk;
-                remaining -= chunk;
-            }
+            virtual_tcp.txlen += got;
         } else if (got == 0) {
-            // Host closed connection
             DEBUG("Uthernet II: TCP host closed connection (poll)\n");
-            if (!virtual_tcp.fin_sent) {
-                inject_tcp_response(socknum, TCP_FIN | TCP_ACK_FLAG, NULL, 0);
-                virtual_tcp.fin_sent = true;
-                virtual_tcp.our_seq++;
-            }
-            close(virtual_tcp.fd);
-            virtual_tcp.fd = -1;
-            // Full state reset for next connection
-            virtual_tcp.established = false;
-            virtual_tcp.fin_sent = false;
-            virtual_tcp.fin_received = false;
-            DEBUG("Uthernet II: TCP connection fully closed (host initiated), ready for new\n");
+            virtual_tcp.host_closed = true;
         }
     }
+
+    // Send what's unsent, within the Apple II's window and what fits in
+    // the W5100's receive buffer right now (nothing is ever dropped there)
+    int frame_overhead = 2 + ETH_HEADER_LEN + IPH_HEADER_LEN + TCP_HEADER_LEN;
+    for (;;) {
+        int inflight = (int)(virtual_tcp.our_seq - virtual_tcp.snd_una);
+        int unsent = virtual_tcp.txlen - inflight;
+        int window = (int)virtual_tcp.snd_wnd - inflight;
+        word used = (ss->rx_tail - ss->rx_head) & (SOCK_BUF_SIZE - 1);
+        int room = SOCK_BUF_SIZE - 1 - used - frame_overhead;
+        int chunk = unsent;
+        if (chunk > VTCP_CHUNK) chunk = VTCP_CHUNK;
+        if (chunk > window) chunk = window;
+        if (chunk > room) chunk = room;
+        if (chunk <= 0) break;
+        if (chunk < unsent && chunk < 128 && chunk < window) break;  // wait for room, not slivers
+        inject_tcp_response(socknum, TCP_ACK_FLAG | TCP_PSH, virtual_tcp.txbuf + inflight, chunk);
+        virtual_tcp.our_seq += chunk;
+    }
+
+    // Host closed and the Apple II has everything: finish like a real host
+    if (virtual_tcp.host_closed && virtual_tcp.txlen == 0 && !virtual_tcp.fin_sent) {
+        inject_tcp_response(socknum, TCP_FIN | TCP_ACK_FLAG, NULL, 0);
+        virtual_tcp.fin_sent = true;
+        virtual_tcp.our_seq++;
+        close(virtual_tcp.fd);
+        virtual_tcp.fd = -1;
+        // Full state reset for next connection
+        virtual_tcp.established = false;
+        virtual_tcp.fin_sent = false;
+        virtual_tcp.fin_received = false;
+        DEBUG("Uthernet II: TCP connection fully closed (host initiated), ready for new\n");
+    }
+}
+
+//=============================================================================
+// Virtual UDP
+//
+// Datagrams the Apple II sends to the virtual network (192.168.64.x,
+// 192.168.65.x) or to the broadcast address go to the same port on
+// localhost; whatever comes back is delivered as if from the address it was
+// sent to (a broadcast is answered by the gateway, 192.168.65.1, which the
+// virtual TCP also routes to localhost). Enough for LAN service discovery.
+//
+// BOBBIN_U2_UDP_PORT=n sends them all to localhost:n instead: a test can give
+// its emulated Apple II a discovery channel of its own, so it never finds
+// (or is found by) a real proxy listening on the usual port.
+//=============================================================================
+
+static struct {
+    int fd;                     // Host UDP socket (-1 = not open yet)
+    byte client_mac[6];
+    byte client_ip[4];
+    byte reply_ip[4];           // Source address for datagrams we deliver
+    word client_port;
+} virtual_udp = { .fd = -1 };
+
+static void handle_udp_packet(int socknum, byte *frame, int len)
+{
+    byte *ip = frame + ETH_HEADER_LEN;
+    byte *udp = ip + IPH_HEADER_LEN;
+    if (len < ETH_HEADER_LEN + IPH_HEADER_LEN + UDP_HEADER_LEN) return;
+    int udp_len = (udp[UDP_LEN] << 8) | udp[UDP_LEN + 1];
+    if (udp_len < UDP_HEADER_LEN || ETH_HEADER_LEN + IPH_HEADER_LEN + udp_len > len) return;
+
+    byte *dst = ip + IPH_DST;
+    bool broadcast = dst[0] == 255 && dst[1] == 255 && dst[2] == 255 && dst[3] == 255;
+    bool virtual_net = dst[0] == 192 && dst[1] == 168 && (dst[2] == 64 || dst[2] == 65);
+    if (!broadcast && !virtual_net) return;
+
+    if (virtual_udp.fd < 0) {
+        virtual_udp.fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (virtual_udp.fd < 0) return;
+        fcntl(virtual_udp.fd, F_SETFL, O_NONBLOCK);
+    }
+    memcpy(virtual_udp.client_mac, frame + ETH_SRC, 6);
+    memcpy(virtual_udp.client_ip, ip + IPH_SRC, 4);
+    memcpy(virtual_udp.reply_ip, broadcast ? VIRTUAL_GATEWAY : dst, 4);
+    virtual_udp.client_port = (udp[UDP_SRC_PORT] << 8) | udp[UDP_SRC_PORT + 1];
+    word dst_port = (udp[UDP_DST_PORT] << 8) | udp[UDP_DST_PORT + 1];
+    const char *redirect = getenv("BOBBIN_U2_UDP_PORT");
+    if (redirect && atoi(redirect) > 0 && atoi(redirect) < 65536)
+        dst_port = atoi(redirect);
+
+    struct sockaddr_in to = { 0 };
+    to.sin_family = AF_INET;
+    to.sin_port = htons(dst_port);
+    to.sin_addr.s_addr = htonl(0x7F000001);  // 127.0.0.1
+    sendto(virtual_udp.fd, udp + UDP_HEADER_LEN, udp_len - UDP_HEADER_LEN, 0,
+           (struct sockaddr *)&to, sizeof to);
+    DEBUG("Uthernet II: UDP %d bytes -> localhost:%d\n", udp_len - UDP_HEADER_LEN, dst_port);
+}
+
+static void virtual_udp_poll(int socknum)
+{
+    if (virtual_udp.fd < 0) return;
+    SocketState *ss = &u2.sockets[socknum];
+
+    byte data[512];
+    struct sockaddr_in from;
+    socklen_t from_len = sizeof from;
+    int frame_len = ETH_HEADER_LEN + IPH_HEADER_LEN + UDP_HEADER_LEN;
+    word used = (ss->rx_tail - ss->rx_head) & (SOCK_BUF_SIZE - 1);
+    if (SOCK_BUF_SIZE - 1 - used < 2 + frame_len + (int)sizeof data) return;  // wait for room
+    ssize_t n = recvfrom(virtual_udp.fd, data, sizeof data, 0, (struct sockaddr *)&from, &from_len);
+    if (n <= 0) return;
+
+    byte pkt[2 + ETH_HEADER_LEN + IPH_HEADER_LEN + UDP_HEADER_LEN + sizeof data];
+    int pos = 2;                                // W5100 length prefix
+    memcpy(&pkt[pos + ETH_DST], virtual_udp.client_mac, 6);
+    memcpy(&pkt[pos + ETH_SRC], VIRTUAL_GATEWAY_MAC, 6);
+    pkt[pos + ETH_TYPE] = 0x08;
+    pkt[pos + ETH_TYPE + 1] = 0x00;
+    pos += ETH_HEADER_LEN;
+
+    int ip_start = pos;
+    int udp_len = UDP_HEADER_LEN + (int)n;
+    int ip_len = IPH_HEADER_LEN + udp_len;
+    pkt[pos++] = 0x45;
+    pkt[pos++] = 0x00;
+    pkt[pos++] = ip_len >> 8;
+    pkt[pos++] = ip_len & 0xFF;
+    pkt[pos++] = 0x00; pkt[pos++] = 0x02;      // ID
+    pkt[pos++] = 0x00; pkt[pos++] = 0x00;      // Flags, fragment
+    pkt[pos++] = 64;
+    pkt[pos++] = 17;                            // UDP
+    pkt[pos++] = 0x00; pkt[pos++] = 0x00;      // Checksum placeholder
+    memcpy(&pkt[pos], virtual_udp.reply_ip, 4);
+    pos += 4;
+    memcpy(&pkt[pos], virtual_udp.client_ip, 4);
+    pos += 4;
+    word ip_cksum = ip_checksum(&pkt[ip_start], IPH_HEADER_LEN);
+    pkt[ip_start + IPH_CHECKSUM] = ip_cksum >> 8;
+    pkt[ip_start + IPH_CHECKSUM + 1] = ip_cksum & 0xFF;
+
+    word src_port = ntohs(from.sin_port);
+    pkt[pos++] = src_port >> 8;
+    pkt[pos++] = src_port & 0xFF;
+    pkt[pos++] = virtual_udp.client_port >> 8;
+    pkt[pos++] = virtual_udp.client_port & 0xFF;
+    pkt[pos++] = udp_len >> 8;
+    pkt[pos++] = udp_len & 0xFF;
+    pkt[pos++] = 0x00; pkt[pos++] = 0x00;      // No UDP checksum (allowed for IPv4)
+    memcpy(&pkt[pos], data, n);
+    pos += n;
+
+    pkt[0] = pos >> 8;
+    pkt[1] = pos & 0xFF;
+    for (int i = 0; i < pos; i++) {
+        ss->rx_buf[(ss->rx_tail + i) & (SOCK_BUF_SIZE - 1)] = pkt[i];
+    }
+    ss->rx_tail += pos;
+    DEBUG("Uthernet II: UDP %zd bytes from localhost:%d delivered\n", n, src_port);
 }
 
 // Handle MACRAW mode SEND - check for DHCP and respond virtually
@@ -969,7 +1148,7 @@ static void handle_macraw_send(int socknum)
     word tx_rd = WORD(u2.memory[base + Sn_TX_RD + 1], u2.memory[base + Sn_TX_RD]);
     word tx_wr = WORD(u2.memory[base + Sn_TX_WR + 1], u2.memory[base + Sn_TX_WR]);
     word tx_base = get_tx_base(socknum);
-    word tx_mask = SOCK_BUF_SIZE - 1;
+    word tx_mask = get_tx_size(socknum) - 1;
 
     // Calculate frame size
     int frame_len = (tx_wr - tx_rd) & tx_mask;
@@ -978,10 +1157,11 @@ static void handle_macraw_send(int socknum)
         return;
     }
 
-    // Read frame from TX buffer
+    // Read frame from TX buffer. Like the real W5100, the physical address
+    // is base + (pointer AND size-1) - the driver writes it the same way.
     byte frame[1600];
     for (int i = 0; i < frame_len; i++) {
-        word addr = tx_base + ((tx_rd - tx_base + i) & tx_mask);
+        word addr = tx_base + ((tx_rd + i) & tx_mask);
         frame[i] = u2.memory[addr];
     }
 
@@ -1047,6 +1227,12 @@ static void handle_macraw_send(int socknum)
                     handle_tcp_packet(socknum, frame, frame_len);
                     return;
                 }
+            }
+
+            // UDP (protocol 17) that isn't DHCP: virtual UDP
+            if (protocol == 17) {
+                handle_udp_packet(socknum, frame, frame_len);
+                return;
             }
         }
     }
@@ -1171,9 +1357,22 @@ static word get_socket_base(int socknum)
     return W5100_S0_BASE + (socknum * 0x100);
 }
 
+// TX buffer size for a socket, from the TMSR register (2 bits per socket:
+// 1K/2K/4K/8K). Drivers set this - IP65 gives sockets 0 and 1 4KB each -
+// and they compute physical TX addresses from it, so we must agree.
+static word get_tx_size(int socknum)
+{
+    byte tmsr = u2.memory[W5100_TMSR];
+    return (word)(0x400 << ((tmsr >> (socknum * 2)) & 3));
+}
+
 static word get_tx_base(int socknum)
 {
-    return W5100_TX_BASE + (socknum * SOCK_BUF_SIZE);
+    word base = W5100_TX_BASE;
+    for (int i = 0; i < socknum; i++) {
+        base += get_tx_size(i);
+    }
+    return base;
 }
 
 static word get_rx_base(int socknum)
@@ -1197,9 +1396,10 @@ static byte w5100_read(word addr)
         if (socknum < 4) {
             // Poll for socket state changes
             socket_poll(socknum);
-            // Also poll virtual TCP for MACRAW mode
+            // Also poll virtual TCP/UDP for MACRAW mode
             if (u2.sockets[socknum].macraw_mode) {
                 virtual_tcp_poll(socknum);
+                virtual_udp_poll(socknum);
             }
 
             // Handle special read-only registers
@@ -1211,7 +1411,8 @@ static byte w5100_read(word addr)
                                  u2.memory[base + Sn_TX_RD]);
                 word tx_wr = WORD(u2.memory[base + Sn_TX_WR + 1],
                                  u2.memory[base + Sn_TX_WR]);
-                word fsr = SOCK_BUF_SIZE - ((tx_wr - tx_rd) & (SOCK_BUF_SIZE - 1));
+                word tx_size = get_tx_size(socknum);
+                word fsr = tx_size - ((tx_wr - tx_rd) & (tx_size - 1));
 
                 if (offset == Sn_TX_FSR) {
                     return HI(fsr);
@@ -1711,10 +1912,25 @@ static byte handler(word loc, int val, int ploc, int psw)
     return result;
 }
 
+// BOBBIN_U2_RESET_ON_RESET=1: an Apple II reset (Ctrl-Reset) resets the
+// W5100 too, as a card wired to the bus /RESET line would. Whether a real
+// Uthernet II does is unconfirmed, so software should survive both.
+static void reset_with_machine(Event *e)
+{
+    if (e->type == EV_RESET) {
+        w5100_reset();
+        u2.mode = 0;
+    }
+}
+
 static void init(void)
 {
     DEBUG("Uthernet II: Initializing in slot %d\n", slot_num);
     w5100_reset();
+    const char *r = getenv("BOBBIN_U2_RESET_ON_RESET");
+    if (r && *r && *r != '0') {
+        event_reghandler(reset_with_machine);
+    }
 }
 
 // Public configuration function
